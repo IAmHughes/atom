@@ -45,7 +45,6 @@ class TreeSitterLanguageMode {
     this.hasQueuedParse = false
 
     this.grammarForLanguageString = this.grammarForLanguageString.bind(this)
-    this.emitRangeUpdate = this.emitRangeUpdate.bind(this)
 
     this.subscription = this.buffer.onDidChangeText(({changes}) => {
       for (let i = 0, {length} = changes; i < length; i++) {
@@ -68,6 +67,25 @@ class TreeSitterLanguageMode {
     // TODO: Remove this once TreeSitterLanguageMode implements its own auto-indentation system. This
     // is temporarily needed in order to delegate to the TextMateLanguageMode's auto-indent system.
     this.regexesByPattern = {}
+  }
+
+  async parseCompletePromise () {
+    let done = false
+    while (!done) {
+      if (this.rootLanguageLayer.currentParsePromise) {
+        await this.rootLanguageLayer.currentParsePromises
+      } else {
+        done = true
+        for (const marker of this.injectionsMarkerLayer.getMarkers()) {
+          if (marker.languageLayer.currentParsePromise) {
+            done = false
+            await marker.languageLayer.currentParsePromise
+            break
+          }
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
   }
 
   destroy () {
@@ -461,13 +479,16 @@ class TreeSitterLanguageMode {
   }
 
   scopeDescriptorForPosition (point) {
+    point = Point.fromObject(point)
     const iterator = this.buildHighlightIterator()
     const scopes = []
     for (const scope of iterator.seek(point)) {
       scopes.push(this.grammar.scopeNameForScopeId(scope))
     }
-    for (const scope of iterator.getOpenScopeIds()) {
-      scopes.push(this.grammar.scopeNameForScopeId(scope))
+    if (point.isEqual(iterator.getPosition())) {
+      for (const scope of iterator.getOpenScopeIds()) {
+        scopes.push(this.grammar.scopeNameForScopeId(scope))
+      }
     }
     if (scopes.length === 0 || scopes[0] !== this.grammar.scopeName) {
       scopes.unshift(this.grammar.scopeName)
@@ -548,8 +569,8 @@ class LanguageLayer {
     if (this.patchSinceCurrentParseStarted) {
       this.patchSinceCurrentParseStarted.splice(
         oldRange.start,
-        oldRange.end,
-        newRange.end,
+        oldRange.getExtent(),
+        newRange.getExtent(),
         oldText,
         newText
       )
@@ -613,10 +634,14 @@ class LanguageLayer {
 
     const changes = this.patchSinceCurrentParseStarted.getChanges()
     this.patchSinceCurrentParseStarted = null
-    for (let i = changes.length - 1; i >= 0; i--) {
-      const {oldStart, oldEnd, newEnd, oldText, newText} = changes[i]
+    for (const {oldStart, newStart, oldEnd, newEnd, oldText, newText} of changes) {
+      const newExtent = Point.fromObject(newEnd).traversalFrom(newStart)
       tree.edit(this._treeEditForBufferChange(
-        oldStart, oldEnd, newEnd, oldText, newText
+        newStart,
+        oldEnd,
+        Point.fromObject(oldStart).traverse(newExtent),
+        oldText,
+        newText
       ))
     }
 
@@ -624,18 +649,22 @@ class LanguageLayer {
       const rangesWithSyntaxChanges = this.tree.getChangedRanges(tree)
       this.tree = tree
 
-      if (!affectedRange) return
       if (rangesWithSyntaxChanges.length > 0) {
         for (const range of rangesWithSyntaxChanges) {
           this.languageMode.emitRangeUpdate(rangeForNode(range))
         }
 
-        affectedRange = affectedRange.union(new Range(
+        const combinedRangeWithSyntaxChange = new Range(
           rangesWithSyntaxChanges[0].startPosition,
           last(rangesWithSyntaxChanges).endPosition
-        ))
-      } else {
-        this.languageMode.emitRangeUpdate(affectedRange)
+        )
+
+        if (affectedRange) {
+          this.languageMode.emitRangeUpdate(affectedRange)
+          affectedRange = affectedRange.union(combinedRangeWithSyntaxChange)
+        } else {
+          affectedRange = combinedRangeWithSyntaxChange
+        }
       }
     } else {
       this.tree = tree
@@ -647,17 +676,17 @@ class LanguageLayer {
       }
     }
 
-    const injectionPromise = this._populateInjections(affectedRange, nodeRangeSet)
-    if (injectionPromise) {
-      params.async = true
-      return injectionPromise
+    if (affectedRange) {
+      const injectionPromise = this._populateInjections(affectedRange, nodeRangeSet)
+      if (injectionPromise) {
+        params.async = true
+        return injectionPromise
+      }
     }
   }
 
   _populateInjections (range, nodeRangeSet) {
-    const {injectionsMarkerLayer, grammarForLanguageString} = this.languageMode
-
-    const existingInjectionMarkers = injectionsMarkerLayer
+    const existingInjectionMarkers = this.languageMode.injectionsMarkerLayer
       .findMarkers({intersectsRange: range})
       .filter(marker => marker.parentLanguageLayer === this)
 
@@ -680,7 +709,7 @@ class LanguageLayer {
         const languageName = injectionPoint.language(node)
         if (!languageName) continue
 
-        const grammar = grammarForLanguageString(languageName)
+        const grammar = this.languageMode.grammarForLanguageString(languageName)
         if (!grammar) continue
 
         const contentNodes = injectionPoint.content(node)
@@ -695,7 +724,7 @@ class LanguageLayer {
           m.languageLayer.grammar === grammar
         )
         if (!marker) {
-          marker = injectionsMarkerLayer.markRange(injectionRange)
+          marker = this.languageMode.injectionsMarkerLayer.markRange(injectionRange)
           marker.languageLayer = new LanguageLayer(this.languageMode, grammar, injectionPoint.contentChildTypes)
           marker.parentLanguageLayer = this
         }
@@ -1047,14 +1076,13 @@ class NodeRangeSet {
       let index = node.startIndex
 
       for (const child of node.children) {
-        const nextPosition = child.startPosition
         const nextIndex = child.startIndex
         if (nextIndex > index) {
           this._pushRange(previousRanges, result, {
             startIndex: index,
             endIndex: nextIndex,
             startPosition: position,
-            endPosition: nextPosition
+            endPosition: child.startPosition
           })
         }
         position = child.endPosition
