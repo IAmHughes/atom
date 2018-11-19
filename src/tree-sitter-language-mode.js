@@ -99,10 +99,13 @@ class TreeSitterLanguageMode {
     return this.grammar.scopeName
   }
 
-  bufferDidChange (change) {
-    this.rootLanguageLayer.handleTextChange(change)
+  bufferDidChange ({oldRange, newRange, oldText, newText}) {
+    const edit = this.rootLanguageLayer._treeEditForBufferChange(
+      oldRange.start, oldRange.end, newRange.end, oldText, newText
+    )
+    this.rootLanguageLayer.handleTextChange(edit, oldText, newText)
     for (const marker of this.injectionsMarkerLayer.getMarkers()) {
-      marker.languageLayer.handleTextChange(change)
+      marker.languageLayer.handleTextChange(edit, oldText, newText)
     }
   }
 
@@ -139,11 +142,7 @@ class TreeSitterLanguageMode {
 
   buildHighlightIterator () {
     if (!this.rootLanguageLayer) return new NullHighlightIterator()
-    const layerIterators = [
-      this.rootLanguageLayer.buildHighlightIterator(),
-      ...this.injectionsMarkerLayer.getMarkers().map(m => m.languageLayer.buildHighlightIterator())
-    ]
-    return new HighlightIterator(this, layerIterators)
+    return new HighlightIterator(this)
   }
 
   onDidTokenize (callback) {
@@ -482,7 +481,7 @@ class TreeSitterLanguageMode {
     point = Point.fromObject(point)
     const iterator = this.buildHighlightIterator()
     const scopes = []
-    for (const scope of iterator.seek(point)) {
+    for (const scope of iterator.seek(point, point.row + 1)) {
       scopes.push(this.grammar.scopeNameForScopeId(scope))
     }
     if (point.isEqual(iterator.getPosition())) {
@@ -546,31 +545,30 @@ class LanguageLayer {
     }
   }
 
-  handleTextChange ({oldRange, newRange, oldText, newText}) {
-    if (this.tree) {
-      this.tree.edit(this._treeEditForBufferChange(
-        oldRange.start, oldRange.end, newRange.end, oldText, newText
-      ))
+  handleTextChange (edit, oldText, newText) {
+    const {startPosition, oldEndPosition, newEndPosition} = edit
 
+    if (this.tree) {
+      this.tree.edit(edit)
       if (this.editedRange) {
-        if (newRange.start.isLessThan(this.editedRange.start)) {
-          this.editedRange.start = newRange.start
+        if (startPosition.isLessThan(this.editedRange.start)) {
+          this.editedRange.start = startPosition
         }
-        if (oldRange.end.isLessThan(this.editedRange.end)) {
-          this.editedRange.end = newRange.end.traverse(this.editedRange.end.traversalFrom(oldRange.end))
+        if (oldEndPosition.isLessThan(this.editedRange.end)) {
+          this.editedRange.end = newEndPosition.traverse(this.editedRange.end.traversalFrom(oldEndPosition))
         } else {
-          this.editedRange.end = newRange.end
+          this.editedRange.end = newEndPosition
         }
       } else {
-        this.editedRange = newRange.copy()
+        this.editedRange = new Range(startPosition, newEndPosition)
       }
     }
 
     if (this.patchSinceCurrentParseStarted) {
       this.patchSinceCurrentParseStarted.splice(
-        oldRange.start,
-        oldRange.getExtent(),
-        newRange.getExtent(),
+        startPosition,
+        oldEndPosition.traversalFrom(startPosition),
+        newEndPosition.traversalFrom(startPosition),
         oldText,
         newText
       )
@@ -588,12 +586,12 @@ class LanguageLayer {
 
   async update (nodeRangeSet) {
     if (!this.currentParsePromise) {
-      do {
+      while (!this.destroyed && (!this.tree || this.tree.rootNode.hasChanges())) {
         const params = {async: false}
         this.currentParsePromise = this._performUpdate(nodeRangeSet, params)
         if (!params.async) break
         await this.currentParsePromise
-      } while (this.tree && this.tree.rootNode.hasChanges())
+      }
       this.currentParsePromise = null
     }
   }
@@ -614,6 +612,7 @@ class LanguageLayer {
       includedRanges = nodeRangeSet.getRanges()
       if (includedRanges.length === 0) {
         this.tree = null
+        this.destroyed = true
         return
       }
     }
@@ -698,14 +697,15 @@ class LanguageLayer {
     }
 
     const markersToUpdate = new Map()
-    for (const injectionPoint of this.grammar.injectionPoints) {
-      const nodes = this.tree.rootNode.descendantsOfType(
-        injectionPoint.type,
-        range.start,
-        range.end
-      )
+    const nodes = this.tree.rootNode.descendantsOfType(
+      Object.keys(this.grammar.injectionPointsByType),
+      range.start,
+      range.end
+    )
 
-      for (const node of nodes) {
+    let existingInjectionMarkerIndex = 0
+    for (const node of nodes) {
+      for (const injectionPoint of this.grammar.injectionPointsByType[node.type]) {
         const languageName = injectionPoint.language(node)
         if (!languageName) continue
 
@@ -719,10 +719,25 @@ class LanguageLayer {
         if (!injectionNodes.length) continue
 
         const injectionRange = rangeForNode(node)
-        let marker = existingInjectionMarkers.find(m =>
-          m.getRange().isEqual(injectionRange) &&
-          m.languageLayer.grammar === grammar
-        )
+
+        let marker
+        for (let i = existingInjectionMarkerIndex, n = existingInjectionMarkers.length; i < n; i++) {
+          const existingMarker = existingInjectionMarkers[i]
+          const comparison = existingMarker.getRange().compare(injectionRange)
+          if (comparison > 0) {
+            break
+          } else if (comparison === 0) {
+            existingInjectionMarkerIndex = i
+            if (existingMarker.languageLayer.grammar === grammar) {
+              marker = existingMarker
+              marker.id === node.id
+              break
+            }
+          } else {
+            existingInjectionMarkerIndex = i
+          }
+        }
+
         if (!marker) {
           marker = this.languageMode.injectionsMarkerLayer.markRange(injectionRange)
           marker.languageLayer = new LanguageLayer(this.languageMode, grammar, injectionPoint.contentChildTypes)
@@ -765,12 +780,22 @@ class LanguageLayer {
 }
 
 class HighlightIterator {
-  constructor (languageMode, iterators) {
+  constructor (languageMode) {
     this.languageMode = languageMode
-    this.iterators = iterators.sort((a, b) => b.getIndex() - a.getIndex())
+    this.iterators = null
   }
 
-  seek (targetPosition) {
+  seek (targetPosition, endRow) {
+    const injectionMarkers = this.languageMode.injectionsMarkerLayer.findMarkers({
+      intersectsRange: new Range(targetPosition, new Point(endRow + 1, 0))
+    })
+
+    this.iterators = [this.languageMode.rootLanguageLayer.buildHighlightIterator()]
+    for (const marker of injectionMarkers) {
+      this.iterators.push(marker.languageLayer.buildHighlightIterator())
+    }
+    this.iterators.sort((a, b) => b.getIndex() - a.getIndex())
+
     const containingTags = []
     const containingTagStartIndices = []
     const targetIndex = this.languageMode.buffer.characterIndexForPosition(targetPosition)
