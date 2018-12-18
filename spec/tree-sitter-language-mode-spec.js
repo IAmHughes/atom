@@ -1307,6 +1307,42 @@ describe('TreeSitterLanguageMode', () => {
       `)
     })
 
+    it('updates fold locations when the buffer changes', () => {
+      const grammar = new TreeSitterGrammar(atom.grammars, jsGrammarPath, {
+        parser: 'tree-sitter-javascript',
+        folds: [
+          {
+            start: {type: '{', index: 0},
+            end: {type: '}', index: -1}
+          }
+        ]
+      })
+
+      buffer.setText(dedent `
+        class A {
+          // a
+          constructor (b) {
+            this.b = b
+          }
+        }
+      `)
+
+      const languageMode = new TreeSitterLanguageMode({buffer, grammar})
+      buffer.setLanguageMode(languageMode)
+      expect(languageMode.isFoldableAtRow(0)).toBe(true)
+      expect(languageMode.isFoldableAtRow(1)).toBe(false)
+      expect(languageMode.isFoldableAtRow(2)).toBe(true)
+      expect(languageMode.isFoldableAtRow(3)).toBe(false)
+      expect(languageMode.isFoldableAtRow(4)).toBe(false)
+
+      buffer.insert([0, 0], '\n')
+      expect(languageMode.isFoldableAtRow(0)).toBe(false)
+      expect(languageMode.isFoldableAtRow(1)).toBe(true)
+      expect(languageMode.isFoldableAtRow(2)).toBe(false)
+      expect(languageMode.isFoldableAtRow(3)).toBe(true)
+      expect(languageMode.isFoldableAtRow(4)).toBe(false)
+    })
+
     describe('when folding a node that ends with a line break', () => {
       it('ends the fold at the end of the previous line', async () => {
         const grammar = new TreeSitterGrammar(atom.grammars, pythonGrammarPath, {
@@ -1424,7 +1460,8 @@ describe('TreeSitterLanguageMode', () => {
         parser: 'tree-sitter-javascript',
         scopes: {
           program: 'source.js',
-          property_identifier: 'property.name'
+          property_identifier: 'property.name',
+          comment: 'comment.block'
         }
       })
 
@@ -1446,6 +1483,15 @@ describe('TreeSitterLanguageMode', () => {
       expect(token.scopes).toEqual([
         'source.js',
         'property.name'
+      ])
+
+      buffer.setText('// baz\n')
+
+      // Adjust position when at end of line
+      buffer.setLanguageMode(new TreeSitterLanguageMode({buffer, grammar}))
+      expect(editor.scopeDescriptorForBufferPosition([0, '// baz'.length]).getScopesArray()).toEqual([
+        'source.js',
+        'comment.block'
       ])
     })
 
@@ -1559,6 +1605,15 @@ describe('TreeSitterLanguageMode', () => {
         'object',
         'pair',
         'property_identifier'
+      ])
+
+      buffer.setText('//bar\n')
+
+      buffer.setLanguageMode(new TreeSitterLanguageMode({buffer, grammar}))
+      expect(editor.syntaxTreeScopeDescriptorForBufferPosition([0, 5]).getScopesArray()).toEqual([
+        'source.js',
+        'program',
+        'comment'
       ])
     })
 
