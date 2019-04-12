@@ -23,6 +23,92 @@ const ConfigSchema = require('../config-schema')
 
 const LocationSuffixRegExp = /(:\d+)(:\d+)?$/
 
+const getDefaultPath = () => {
+  const editor = atom.workspace.getActiveTextEditor()
+  if (!editor || !editor.getPath()) {
+    return
+  }
+  const paths = atom.project.getPaths()
+  if (paths) {
+    return paths[0]
+  }
+}
+
+const getSocketSecretPath = (atomVersion) => {
+  const {username} = os.userInfo()
+  const atomHome = path.resolve(process.env.ATOM_HOME)
+
+  return path.join(atomHome, `.atom-socket-secret-${username}-${atomVersion}`)
+}
+
+const getSocketPath = (socketSecret) => {
+  if (!socketSecret) {
+    return null
+  }
+
+  // Hash the secret to create the socket name to not expose it.
+  const socketName = crypto
+    .createHmac('sha256', socketSecret)
+    .update('socketName')
+    .digest('hex')
+    .substr(0, 12)
+
+  if (process.platform === 'win32') {
+    return `\\\\.\\pipe\\atom-${socketName}-sock`
+  } else {
+    return path.join(os.tmpdir(), `atom-${socketName}.sock`)
+  }
+}
+
+const getExistingSocketSecret = (atomVersion) => {
+  const socketSecretPath = getSocketSecretPath(atomVersion)
+
+  if (!fs.existsSync(socketSecretPath)) {
+    return null
+  }
+
+  return fs.readFileSync(socketSecretPath, 'utf8')
+}
+
+const createSocketSecret = (atomVersion) => {
+  const socketSecret = crypto.randomBytes(16).toString('hex')
+
+  fs.writeFileSync(getSocketSecretPath(atomVersion), socketSecret, {encoding: 'utf8', mode: 0o600})
+
+  return socketSecret
+}
+
+const encryptOptions = (options, secret) => {
+  const message = JSON.stringify(options)
+
+  const initVector = crypto.randomBytes(16)
+
+  const cipher = crypto.createCipheriv('aes-256-gcm', secret, initVector)
+
+  let content = cipher.update(message, 'utf8', 'hex')
+  content += cipher.final('hex')
+
+  const authTag = cipher.getAuthTag().toString('hex')
+
+  return JSON.stringify({
+    authTag,
+    content,
+    initVector: initVector.toString('hex')
+  })
+}
+
+const decryptOptions = (optionsMessage, secret) => {
+  const {authTag, content, initVector} = JSON.parse(optionsMessage)
+
+  const decipher = crypto.createDecipheriv('aes-256-gcm', secret, Buffer.from(initVector, 'hex'))
+  decipher.setAuthTag(Buffer.from(authTag, 'hex'))
+
+  let message = decipher.update(content, 'hex', 'utf8')
+  message += decipher.final('utf8')
+
+  return JSON.parse(message)
+}
+
 // The application's singleton class.
 //
 // It's the entry point into the Atom application and maintains the global state
@@ -32,50 +118,23 @@ module.exports =
 class AtomApplication extends EventEmitter {
   // Public: The entry point into the Atom application.
   static open (options) {
-    if (!options.socketPath) {
-      const {username} = os.userInfo()
-
-      // Lowercasing the ATOM_HOME to make sure that we don't get multiple sockets
-      // on case-insensitive filesystems due to arbitrary case differences in paths.
-      const atomHomeUnique = path.resolve(process.env.ATOM_HOME).toLowerCase()
-      const hash = crypto
-        .createHash('sha1')
-        .update(options.version)
-        .update('|')
-        .update(process.arch)
-        .update('|')
-        .update(username || '')
-        .update('|')
-        .update(atomHomeUnique)
-
-      // We only keep the first 12 characters of the hash as not to have excessively long
-      // socket file. Note that macOS/BSD limit the length of socket file paths (see #15081).
-      // The replace calls convert the digest into "URL and Filename Safe" encoding (see RFC 4648).
-      const atomInstanceDigest = hash
-        .digest('base64')
-        .substring(0, 12)
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-
-      if (process.platform === 'win32') {
-        options.socketPath = `\\\\.\\pipe\\atom-${atomInstanceDigest}-sock`
-      } else {
-        options.socketPath = path.join(os.tmpdir(), `atom-${atomInstanceDigest}.sock`)
-      }
-    }
+    const socketSecret = getExistingSocketSecret(options.version)
+    const socketPath = getSocketPath(socketSecret)
 
     // FIXME: Sometimes when socketPath doesn't exist, net.connect would strangely
     // take a few seconds to trigger 'error' event, it could be a bug of node
     // or electron, before it's fixed we check the existence of socketPath to
     // speedup startup.
-    if ((process.platform !== 'win32' && !fs.existsSync(options.socketPath)) ||
-        options.test || options.benchmark || options.benchmarkTest) {
+    if (
+      !socketPath || options.test || options.benchmark || options.benchmarkTest ||
+      (process.platform !== 'win32' && !fs.existsSync(socketPath))
+    ) {
       new AtomApplication(options).initialize(options)
       return
     }
 
-    const client = net.connect({path: options.socketPath}, () => {
-      client.write(JSON.stringify(options), () => {
+    const client = net.connect({path: socketPath}, () => {
+      client.write(encryptOptions(options, socketSecret), () => {
         client.end()
         app.quit()
       })
@@ -91,6 +150,7 @@ class AtomApplication extends EventEmitter {
   constructor (options) {
     super()
     this.quitting = false
+    this.quittingForUpdate = false
     this.getAllWindows = this.getAllWindows.bind(this)
     this.getLastFocusedWindow = this.getLastFocusedWindow.bind(this)
     this.resourcePath = options.resourcePath
@@ -98,11 +158,14 @@ class AtomApplication extends EventEmitter {
     this.version = options.version
     this.devMode = options.devMode
     this.safeMode = options.safeMode
-    this.socketPath = options.socketPath
     this.logFile = options.logFile
     this.userDataDir = options.userDataDir
     this._killProcess = options.killProcess || process.kill.bind(process)
-    if (options.test || options.benchmark || options.benchmarkTest) this.socketPath = null
+
+    if (!options.test && !options.benchmark && !options.benchmarkTest) {
+      this.socketSecret = createSocketSecret(this.version)
+      this.socketPath = getSocketPath(this.socketSecret)
+    }
 
     this.waitSessionsByWindow = new Map()
     this.windowStack = new WindowStack()
@@ -187,6 +250,8 @@ class AtomApplication extends EventEmitter {
                (options.urlsToOpen && options.urlsToOpen.length > 0)) {
       optionsForWindowsToOpen.push(options)
       shouldReopenPreviousWindows = this.config.get('core.restorePreviousWindowsOnStart') === 'always'
+    } else if (options.newWindow) {
+      shouldReopenPreviousWindows = false
     } else {
       shouldReopenPreviousWindows = this.config.get('core.restorePreviousWindowsOnStart') !== 'no'
     }
@@ -206,9 +271,9 @@ class AtomApplication extends EventEmitter {
 
   openWithOptions (options) {
     const {
-      initialPaths,
       pathsToOpen,
       executedFrom,
+      foldersToOpen,
       urlsToOpen,
       benchmark,
       benchmarkTest,
@@ -248,10 +313,10 @@ class AtomApplication extends EventEmitter {
         timeout,
         env
       })
-    } else if (pathsToOpen.length > 0) {
+    } else if ((pathsToOpen && pathsToOpen.length > 0) || (foldersToOpen && foldersToOpen.length > 0)) {
       return this.openPaths({
-        initialPaths,
         pathsToOpen,
+        foldersToOpen,
         executedFrom,
         pidToKillWhenClosed,
         newWindow,
@@ -267,7 +332,6 @@ class AtomApplication extends EventEmitter {
     } else {
       // Always open a editor window if this is the first instance of Atom.
       return this.openPath({
-        initialPaths,
         pidToKillWhenClosed,
         newWindow,
         devMode,
@@ -338,7 +402,15 @@ class AtomApplication extends EventEmitter {
     const server = net.createServer(connection => {
       let data = ''
       connection.on('data', chunk => { data += chunk })
-      connection.on('end', () => this.openWithOptions(JSON.parse(data)))
+      connection.on('end', () => {
+        try {
+          const options = decryptOptions(data, this.socketSecret)
+          this.openWithOptions(options)
+        } catch (e) {
+          // Error while parsing/decrypting the options passed by the client.
+          // We cannot trust the client, aborting.
+        }
+      })
     })
 
     server.listen(this.socketPath)
@@ -360,15 +432,37 @@ class AtomApplication extends EventEmitter {
     }
   }
 
+  deleteSocketSecretFile () {
+    if (!this.socketSecret) {
+      return
+    }
+
+    const socketSecretPath = getSocketSecretPath(this.version)
+
+    if (fs.existsSync(socketSecretPath)) {
+      try {
+        fs.unlinkSync(socketSecretPath)
+      } catch (error) {
+        // Ignore ENOENT errors in case the file was deleted between the exists
+        // check and the call to unlink sync.
+        if (error.code !== 'ENOENT') throw error
+      }
+    }
+  }
+
   // Registers basic application commands, non-idempotent.
   handleEvents () {
-    const getLoadSettings = () => {
+    const getLoadSettings = includeWindow => {
       const window = this.focusedWindow()
-      return {devMode: window && window.devMode, safeMode: window && window.safeMode}
+      return {
+        devMode: window && window.devMode,
+        safeMode: window && window.safeMode,
+        window: includeWindow && window
+      }
     }
 
     this.on('application:quit', () => app.quit())
-    this.on('application:new-window', () => this.openPath(getLoadSettings()))
+    this.on('application:new-window', () => this.openPath(getLoadSettings(false)))
     this.on('application:new-file', () => (this.focusedWindow() || this).openPath())
     this.on('application:open-dev', () => this.promptForPathToOpen('all', {devMode: true}))
     this.on('application:open-safe', () => this.promptForPathToOpen('all', {safeMode: true}))
@@ -386,12 +480,20 @@ class AtomApplication extends EventEmitter {
 
     this.on('application:install-update', () => {
       this.quitting = true
+      this.quittingForUpdate = true
       this.autoUpdateManager.install()
     })
 
     this.on('application:check-for-update', () => this.autoUpdateManager.check())
 
     if (process.platform === 'darwin') {
+      this.on('application:reopen-project', ({ paths }) => {
+        this.openPaths({ pathsToOpen: paths })
+      })
+
+      this.on('application:open', () => this.promptForPathToOpen('all', getLoadSettings(true), getDefaultPath()))
+      this.on('application:open-file', () => this.promptForPathToOpen('file', getLoadSettings(true), getDefaultPath()))
+      this.on('application:open-folder', () => this.promptForPathToOpen('folder', getLoadSettings(true), getDefaultPath()))
       this.on('application:bring-all-windows-to-front', () => Menu.sendActionToFirstResponder('arrangeInFront:'))
       this.on('application:hide', () => Menu.sendActionToFirstResponder('hide:'))
       this.on('application:hide-other-applications', () => Menu.sendActionToFirstResponder('hideOtherApplications:'))
@@ -459,6 +561,7 @@ class AtomApplication extends EventEmitter {
     this.disposable.add(ipcHelpers.on(app, 'will-quit', () => {
       this.killAllProcesses()
       this.deleteSocketFile()
+      this.deleteSocketSecretFile()
     }))
 
     this.disposable.add(ipcHelpers.on(app, 'open-file', (event, pathToOpen) => {
@@ -542,11 +645,11 @@ class AtomApplication extends EventEmitter {
     this.disposable.add(ipcHelpers.on(ipcMain, 'open-command', (event, command, defaultPath) => {
       switch (command) {
         case 'application:open':
-          return this.promptForPathToOpen('all', getLoadSettings(), defaultPath)
+          return this.promptForPathToOpen('all', getLoadSettings(true), defaultPath)
         case 'application:open-file':
-          return this.promptForPathToOpen('file', getLoadSettings(), defaultPath)
+          return this.promptForPathToOpen('file', getLoadSettings(true), defaultPath)
         case 'application:open-folder':
-          return this.promptForPathToOpen('folder', getLoadSettings(), defaultPath)
+          return this.promptForPathToOpen('folder', getLoadSettings(true), defaultPath)
         default:
           return console.log(`Invalid open-command received: ${command}`)
       }
@@ -784,7 +887,6 @@ class AtomApplication extends EventEmitter {
   //   :window - {AtomWindow} to open file paths in.
   //   :addToLastWindow - Boolean of whether this should be opened in last focused window.
   openPath ({
-    initialPaths,
     pathToOpen,
     pidToKillWhenClosed,
     newWindow,
@@ -797,7 +899,6 @@ class AtomApplication extends EventEmitter {
     env
   } = {}) {
     return this.openPaths({
-      initialPaths,
       pathsToOpen: [pathToOpen],
       pidToKillWhenClosed,
       newWindow,
@@ -815,6 +916,7 @@ class AtomApplication extends EventEmitter {
   //
   // options -
   //   :pathsToOpen - The array of file paths to open
+  //   :foldersToOpen - An array of additional paths to open that must be existing directories
   //   :pidToKillWhenClosed - The integer of the pid to kill
   //   :newWindow - Boolean of whether this should be opened in a new window.
   //   :devMode - Boolean to control the opened window's dev mode.
@@ -823,8 +925,8 @@ class AtomApplication extends EventEmitter {
   //   :window - {AtomWindow} to open file paths in.
   //   :addToLastWindow - Boolean of whether this should be opened in last focused window.
   openPaths ({
-    initialPaths,
     pathsToOpen,
+    foldersToOpen,
     executedFrom,
     pidToKillWhenClosed,
     newWindow,
@@ -837,33 +939,57 @@ class AtomApplication extends EventEmitter {
     addToLastWindow,
     env
   } = {}) {
-    if (!pathsToOpen || pathsToOpen.length === 0) return
     if (!env) env = process.env
+    if (!pathsToOpen) pathsToOpen = []
+    if (!foldersToOpen) foldersToOpen = []
+
     devMode = Boolean(devMode)
     safeMode = Boolean(safeMode)
     clearWindowState = Boolean(clearWindowState)
 
-    const locationsToOpen = []
-    for (let i = 0; i < pathsToOpen.length; i++) {
-      const location = this.parsePathToOpen(pathsToOpen[i], executedFrom, addToLastWindow)
-      location.forceAddToWindow = addToLastWindow
-      location.hasWaitSession = pidToKillWhenClosed != null
-      locationsToOpen.push(location)
-      pathsToOpen[i] = location.pathToOpen
+    const locationsToOpen = pathsToOpen.map(pathToOpen => {
+      return this.parsePathToOpen(pathToOpen, executedFrom, {
+        forceAddToWindow: addToLastWindow,
+        hasWaitSession: pidToKillWhenClosed != null
+      })
+    })
+
+    for (const folderToOpen of foldersToOpen) {
+      locationsToOpen.push({
+        pathToOpen: folderToOpen,
+        initialLine: null,
+        initialColumn: null,
+        mustBeDirectory: true,
+        forceAddToWindow: addToLastWindow,
+        hasWaitSession: pidToKillWhenClosed != null
+      })
     }
 
+    if (locationsToOpen.length === 0) {
+      return
+    }
+
+    const normalizedPathsToOpen = locationsToOpen.map(location => location.pathToOpen).filter(Boolean)
+
     let existingWindow
+
+    // Explicitly provided AtomWindow has precedence unless a new window is forced.
     if (!newWindow) {
-      existingWindow = this.windowForPaths(pathsToOpen, devMode)
-      if (!existingWindow) {
-        let lastWindow = window || this.getLastFocusedWindow()
-        if (lastWindow && lastWindow.devMode === devMode) {
-          if (addToLastWindow || (
-              locationsToOpen.every(({stat}) => stat && stat.isFile()) ||
-              (locationsToOpen.some(({stat}) => stat && stat.isDirectory()) && !lastWindow.hasProjectPath()))) {
-            existingWindow = lastWindow
-          }
-        }
+      existingWindow = window
+    }
+
+    // If no window is specified, a new window is not forced, and at least one path is provided, locate
+    // an existing window that contains all paths.
+    if (!existingWindow && !newWindow && normalizedPathsToOpen.length > 0) {
+      existingWindow = this.windowForPaths(normalizedPathsToOpen, devMode)
+    }
+
+    // No window specified, new window not forced, no existing window found, and addition to the last window
+    // requested. Find the last focused window.
+    if (!existingWindow && !newWindow && addToLastWindow) {
+      let lastWindow = window || this.getLastFocusedWindow()
+      if (lastWindow && lastWindow.devMode === devMode) {
+        existingWindow = lastWindow
       }
     }
 
@@ -895,7 +1021,6 @@ class AtomApplication extends EventEmitter {
       if (!windowDimensions) windowDimensions = this.getDimensionsForNewWindow()
 
       openedWindow = new AtomWindow(this, this.fileRecoveryService, {
-        initialPaths,
         locationsToOpen,
         windowInitializationScript,
         resourcePath,
@@ -916,7 +1041,7 @@ class AtomApplication extends EventEmitter {
       }
       this.waitSessionsByWindow.get(openedWindow).push({
         pid: pidToKillWhenClosed,
-        remainingPaths: new Set(pathsToOpen)
+        remainingPaths: new Set(normalizedPathsToOpen)
       })
     }
 
@@ -984,8 +1109,7 @@ class AtomApplication extends EventEmitter {
     const states = await this.storageFolder.load('application.json')
     if (states) {
       return states.map(state => ({
-        initialPaths: state.initialPaths,
-        pathsToOpen: state.initialPaths.filter(p => fs.isDirectorySync(p)),
+        foldersToOpen: state.initialPaths,
         urlsToOpen: [],
         devMode: this.devMode,
         safeMode: this.safeMode
@@ -1264,7 +1388,7 @@ class AtomApplication extends EventEmitter {
     }
   }
 
-  parsePathToOpen (pathToOpen, executedFrom = '') {
+  parsePathToOpen (pathToOpen, executedFrom, extra) {
     let initialColumn, initialLine
     if (!pathToOpen) {
       return {pathToOpen}
@@ -1286,10 +1410,9 @@ class AtomApplication extends EventEmitter {
     }
 
     const normalizedPath = path.normalize(path.resolve(executedFrom, fs.normalize(pathToOpen)))
-    const stat = fs.statSyncNoException(normalizedPath)
-    if (stat || !url.parse(pathToOpen).protocol) pathToOpen = normalizedPath
+    if (!url.parse(pathToOpen).protocol) pathToOpen = normalizedPath
 
-    return {pathToOpen, stat, initialLine, initialColumn}
+    return Object.assign({pathToOpen, initialLine, initialColumn}, extra)
   }
 
   // Opens a native dialog to prompt the user for a path.
@@ -1303,14 +1426,32 @@ class AtomApplication extends EventEmitter {
   //              should be in dev mode or not.
   //   :safeMode - A Boolean which controls whether any newly opened windows
   //               should be in safe mode or not.
-  //   :window - An {AtomWindow} to use for opening a selected file path.
+  //   :window - An {AtomWindow} to use for opening selected file paths as long as
+  //             all are files.
   //   :path - An optional String which controls the default path to which the
   //           file dialog opens.
   promptForPathToOpen (type, {devMode, safeMode, window}, path = null) {
     return this.promptForPath(
       type,
-      pathsToOpen => {
-        return this.openPaths({pathsToOpen, devMode, safeMode, window})
+      async pathsToOpen => {
+        let targetWindow
+
+        // Open in :window as long as no chosen paths are folders. If any chosen path is a folder, open in a
+        // new window instead.
+        if (type === 'folder') {
+          targetWindow = null
+        } else if (type === 'file') {
+          targetWindow = window
+        } else if (type === 'all') {
+          const areDirectories = await Promise.all(
+            pathsToOpen.map(pathToOpen => new Promise(resolve => fs.isDirectory(pathToOpen, resolve)))
+          )
+          if (!areDirectories.some(Boolean)) {
+            targetWindow = window
+          }
+        }
+
+        return this.openPaths({pathsToOpen, devMode, safeMode, window: targetWindow})
       },
       path
     )
@@ -1359,7 +1500,6 @@ class AtomApplication extends EventEmitter {
     const args = []
     if (this.safeMode) args.push('--safe')
     if (this.logFile != null) args.push(`--log-file=${this.logFile}`)
-    if (this.socketPath != null) args.push(`--socket-path=${this.socketPath}`)
     if (this.userDataDir != null) args.push(`--user-data-dir=${this.userDataDir}`)
     if (this.devMode) {
       args.push('--dev')
